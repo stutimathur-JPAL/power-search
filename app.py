@@ -1,277 +1,291 @@
-# ---------- Power Inputs Search (Embeddings) ----------
-# Clean UI + numeric extraction (sd, se, var, icc, power, mde, n)
-# Works with your prebuilt embeddings_dataframe.pkl
+# app.py  — robust filters + safer power-input extraction + titles
 
-import os, re, json, zipfile, math, io, requests
+import os, re, ast, json, zipfile, io
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional fuzzy fallback if no OpenAI key
-try:
-    from rapidfuzz import process, fuzz
-    HAS_FUZZ = True
-except Exception:
-    HAS_FUZZ = False
-
-# Optional OpenAI for query embeddings
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-# ---- CONFIG ----
-DATA_PATH = "data/embeddings_dataframe.pkl"  # your file
-ZIP_CANDIDATES = [
-    "data/embeddings_dataframe.pkl.zip",
-    "data/embeddings_dataframe.zip",
-]
-EMBEDDING_MODEL = "text-embedding-3-large"   # must match how .pkl was created
+# ---------- CONFIG ----------
+DATA_DIR = "data"
+DATA_FILE = "embeddings_dataframe.pkl"           # preferred (unzipped)
+ZIP_FILE  = "embeddings_dataframe.pkl.zip"       # allowed (zipped)
 TOPK_DEFAULT = 10
-MAX_EXCERPT_CHARS = 1200
+MAX_EXCERPT_CHARS = 900
 
-# ---- OPTIONAL: remote download (if you later store the file elsewhere) ----
-REMOTE_URL = st.secrets.get("EMBEDDINGS_URL", "")  # leave blank unless you add it in Streamlit Secrets
-
-# ---- OpenAI client (only if you add OPENAI_API_KEY in Streamlit Secrets) ----
+# ---------- OPENAI (optional for semantic search) ----------
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "")) or None
-client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
-
+try:
+    if OPENAI_API_KEY:
+        from openai import OpenAI
+        oai_client = OpenAI(api_key=OPENAI_API_KEY)
+    else:
+        oai_client = None
+except Exception:
+    oai_client = None
 
 # ---------- Helpers ----------
-def ensure_embeddings_file() -> str:
-    """Return path to the .pkl. If missing, try zip; if provided, try REMOTE_URL."""
-    if os.path.exists(DATA_PATH):
-        return DATA_PATH
+@st.cache_data(show_spinner=False)
+def _load_df() -> pd.DataFrame:
+    """Load embeddings dataframe; accept .pkl or .pkl.zip in /data."""
+    pkl_path = os.path.join(DATA_DIR, DATA_FILE)
+    zip_path = os.path.join(DATA_DIR, ZIP_FILE)
 
-    # Try zip in repo
-    for z in ZIP_CANDIDATES:
-        if os.path.exists(z):
-            try:
-                os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-                with zipfile.ZipFile(z, "r") as zf:
-                    member = next((m for m in zf.namelist() if m.lower().endswith(".pkl")), None)
-                    if not member:
-                        raise RuntimeError("Zip has no .pkl inside.")
-                    with zf.open(member) as src, open(DATA_PATH, "wb") as dst:
-                        dst.write(src.read())
-                return DATA_PATH
-            except Exception as e:
-                st.error(f"Found {z} but failed to extract it: {e}")
-                st.stop()
+    if not os.path.exists(pkl_path):
+        # Try to unzip if a zip exists
+        if os.path.exists(zip_path):
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                # Find inner file (allow any name as long as it ends with .pkl)
+                inner = [n for n in zf.namelist() if n.lower().endswith(".pkl")]
+                if not inner:
+                    raise FileNotFoundError("Zip found but no .pkl inside.")
+                # Extract to memory then write to /data/embeddings_dataframe.pkl
+                with zf.open(inner[0]) as f:
+                    bytes_ = f.read()
+                with open(pkl_path, "wb") as out:
+                    out.write(bytes_)
+        else:
+            raise FileNotFoundError(
+                f"Could not find {DATA_FILE} or {ZIP_FILE} in /{DATA_DIR}. "
+                "Upload your file to data/ (exact name)."
+            )
 
-    # Try remote URL (only if you added EMBEDDINGS_URL in Secrets)
-    if REMOTE_URL:
-        try:
-            os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
-            r = requests.get(REMOTE_URL, timeout=60)
-            r.raise_for_status()
-            with open(DATA_PATH, "wb") as f:
-                f.write(r.content)
-            return DATA_PATH
-        except Exception as e:
-            st.error(f"Failed to download embeddings from EMBEDDINGS_URL: {e}")
-            st.stop()
+    df = pd.read_pickle(pkl_path)
 
-    st.error(f"Could not load {DATA_PATH}. Please upload it to your repo at data/embeddings_dataframe.pkl.")
-    st.stop()
+    # Ensure expected columns exist
+    for col in ["pub_id", "text", "source_type"]:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
 
+    # If embeddings exist, keep them; if not, we do keyword fallback
+    if "embedding" in df.columns:
+        df = df.dropna(subset=["embedding"])
+    return df
 
-def normalize(v):
-    v = np.asarray(v, dtype=float)
-    n = np.linalg.norm(v)
-    return v / n if n else v
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
 
+def _contains(text: str, word_list) -> bool:
+    t = text.lower()
+    return any(w.lower() in t for w in word_list if w)
 
-def get_query_embedding(query: str) -> np.ndarray | None:
-    """Use OpenAI if key is present, else None (fallback to fuzzy)."""
-    if client is None:
+def _is_country_hit(text: str, countries):
+    if not countries: 
+        return True
+    return _contains(text, countries)
+
+def _is_sector_hit(text: str, sectors):
+    if not sectors:
+        return True
+    return _contains(text, sectors)
+
+def _title_from_chunk(txt: str) -> str:
+    """
+    Guess a title-ish line from the top of a paper’s first page/abstract chunk.
+    """
+    t = txt.strip().splitlines()
+    # Look for a longish capitalized line before 'Abstract'
+    for line in t[:15]:
+        clean = line.strip()
+        if 20 <= len(clean) <= 140 and clean[0].isupper():
+            # Avoid lines that are obviously not a title
+            if not re.search(r"^\s*(Table|Figure|Appendix)\b", clean, flags=re.I):
+                return clean
+    # fallback: first sentence
+    m = re.split(r"(?<=[.!?])\s+", txt.strip())
+    return m[0][:120] + ("…" if len(m[0]) > 120 else "")
+
+@st.cache_data(show_spinner=False)
+def build_title_index(df: pd.DataFrame) -> dict:
+    """
+    Build a map pub_id -> best-guess title from earliest page chunk.
+    """
+    # Prefer text chunks, earliest page
+    work = df[df["source_type"] == "text"].copy()
+    if "page" in work.columns:
+        work["page"] = work["page"].fillna(1e9)
+        work = work.sort_values(["pub_id", "page"])
+    else:
+        work = work.sort_values(["pub_id"])
+    titles = {}
+    for pub_id, group in work.groupby("pub_id"):
+        txt = str(group.iloc[0]["text"])
+        titles[pub_id] = _title_from_chunk(txt)
+    return titles
+
+# ---------- Embeddings / scoring ----------
+def embed_query(q: str) -> np.ndarray | None:
+    if not oai_client:
         return None
     try:
-        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=query)
-        return np.array(resp.data[0].embedding, dtype=float)
-    except Exception as e:
-        st.warning(f"Embedding service unavailable, using fallback search. ({e})")
+        r = oai_client.embeddings.create(
+            model="text-embedding-3-large",
+            input=q.strip()
+        )
+        return np.array(r.data[0].embedding, dtype=np.float32)
+    except Exception:
         return None
 
+def dot(a, b): 
+    return float(np.dot(a, b)) if a is not None and b is not None else 0.0
 
-NUM_PAT = r"[-+]?\d+(?:\.\d+)?"
-def _find(pattern, text):
-    m = re.search(pattern, text, flags=re.I)
-    return float(m.group(1)) if m else None
+def rough_keyword_score(q: str, txt: str) -> float:
+    """Fallback scorer if we don’t have an embedding for query/chunks."""
+    qw = set([w for w in re.findall(r"[A-Za-z]+", q.lower()) if len(w) > 2])
+    tw = set([w for w in re.findall(r"[A-Za-z]+", txt.lower()) if len(w) > 2])
+    if not qw: 
+        return 0.0
+    return len(qw & tw) / len(qw)
 
+# ---------- Safer power-input extraction ----------
+NUM = r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)"
 def extract_power_inputs(text: str) -> dict:
     """
-    Pulls key stats commonly used for power inputs.
-    Heuristic but robust to minor formatting variations.
+    Try to pull sd, se, variance, icc, mde, power only when the local wording
+    suggests *parameters*, not 'effects in SD units'.
     """
-    clean = " ".join(text.split())  # collapse whitespace
+    t = " " + text.lower() + " "
 
-    # sd / standard deviation
-    sd = _find(r"(?:\bsd\b|std\.?\s*dev(?:iation)?|standard\s*deviation)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+    def pick(regexes, post_filter=None):
+        for rgx in regexes:
+            m = re.search(rgx, t, flags=re.I)
+            if m:
+                val = m.group(1)
+                try:
+                    x = float(val)
+                except Exception:
+                    continue
+                if post_filter and not post_filter(x, m):
+                    continue
+                return x
+        return None
 
-    # se / standard error
-    se = _find(r"(?:\bse\b|standard\s*error)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+    # heuristics to avoid grabbing years / effect sizes in SD-units:
+    not_year = lambda x, m: not (x >= 1900 and x <= 2100)
+    not_pct_200 = lambda x, m: 0 <= x <= 200
 
-    # variance / var / σ²
-    var = _find(r"(?:\bvariance\b|\bvar\b|σ\^?2|sigma\^?2)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+    # standard deviation: require "standard deviation" or "(sd" or " sd:" near number
+    sd = pick([
+        rf"(?:standard\s+deviation|sd)\s*(?:=|:|\(|of)?\s*({NUM})\b",
+        rf"\b({NUM})\s*(?:standard\s+deviation|sd)\b(?!\s*units)"
+    ], post_filter=not_year)
 
-    # ICC / intracluster corr
-    icc = _find(r"(?:\bicc\b|intra[-\s]*cluster\s*corr(?:elation)?)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+    se = pick([
+        rf"(?:standard\s+error|se)\s*(?:=|:|\()?{NUM}\)?",
+        rf"\b({NUM})\s*(?:standard\s+error|se)\b"
+    ], post_filter=not_year)
 
-    # MDE / detectable effect
-    mde = _find(r"(?:\bmde\b|minimum\s*detectable\s*effect)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+    variance = pick([
+        rf"\bvariance\s*(?:=|:)?\s*({NUM})\b"
+    ], post_filter=not_year)
 
-    # power (as a probability 0–1 or %). Avoid picking up “power grid”, etc.
-    power = _find(r"(?:statistical\s*power|power\s*\(1-β\)|\bpower\b)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+    # ICC usually between 0 and 1 (sometimes up to ~0.5 in practice)
+    icc = pick([
+        rf"\b(?:icc|intracluster|intra[-\s]?cluster\s+correlation(?:\s+coefficient)?)\s*(?:=|:)?\s*({NUM})\b"
+    ], post_filter=lambda x, m: 0 <= x <= 1)
 
-    # sample size n / N / cluster size
-    n = _find(r"(?:\bn\s*=\s*|\bN\s*=\s*)(\d+)", clean)
+    mde = pick([
+        rf"\b(?:mde|minimum\s+detectable\s+effect(?:\s+size)?)\s*(?:=|:)?\s*({NUM})\b%?",
+        rf"\b({NUM})\s*%?\s*(?:mde|minimum\s+detectable\s+effect(?:\s+size)?)\b"
+    ], post_filter=not_pct_200)
 
-    out = {"sd": sd, "se": se, "variance": var, "icc": icc, "mde": mde, "power": power, "n": n}
-    return {k: v for k, v in out.items() if v is not None}
+    power = pick([
+        rf"\bpower\s*(?:=|:)?\s*({NUM})\s*%?\b",
+        rf"\b({NUM})\s*%?\s*power\b"
+    ], post_filter=not_pct_200)
 
+    out = {}
+    if sd is not None: out["sd"] = sd
+    if se is not None: out["se"] = se
+    if variance is not None: out["variance"] = variance
+    if icc is not None: out["icc"] = icc
+    if mde is not None: out["mde"] = mde
+    if power is not None: out["power"] = power
+    return out
 
-def score_numeric_density(text: str) -> int:
-    """Used to boost 'Power Mode' results: count how many target tokens appear."""
-    keys = ["sd", "standard deviation", "se", "standard error", "variance", "var", "icc",
-            "intra cluster", "power", "mde", "minimum detectable", "sample size", " n = "]
-    t = text.lower()
-    return sum(1 for k in keys if k in t)
-
-
-def format_power_inputs(d: dict) -> str:
-    if not d:
-        return "—"
-    nice = []
-    for k in ["sd", "se", "variance", "icc", "mde", "power", "n"]:
-        if k in d:
-            v = d[k]
-            nice.append(f"**{k}**: {v:g}" if isinstance(v, (int, float)) else f"**{k}**: {v}")
-    return " • ".join(nice)
-
-
-def search(df: pd.DataFrame, query: str, top_k: int, power_mode: bool,
-           sector_filter: str, region_filter: str, use_embeddings: bool):
-    work = df.copy()
-
-    # Optional filters by substring (case-insensitive) on text/caption
-    if sector_filter:
-        work = work[work["text"].str.contains(sector_filter, case=False, na=False) |
-                    work.get("caption", pd.Series([""]*len(work))).str.contains(sector_filter, case=False, na=False)]
-
-    if region_filter:
-        work = work[work["text"].str.contains(region_filter, case=False, na=False) |
-                    work.get("caption", pd.Series([""]*len(work))).str.contains(region_filter, case=False, na=False)]
-
-    if work.empty:
-        return work
-
-    # Compute score
-    if use_embeddings:
-        q = get_query_embedding(query)
-        if q is not None:
-            q = normalize(q)
-            def dot_sim(vec):
-                v = normalize(np.array(vec, dtype=float))
-                return float(np.dot(v, q))
-            work["score"] = work["embedding"].apply(dot_sim)
-        else:
-            use_embeddings = False  # fallback below
-
-    if not use_embeddings:
-        # Fallback: fuzzy + keyword boosts
-        if not HAS_FUZZ:
-            # simple keyword count
-            key = query.lower()
-            work["score"] = work["text"].str.lower().str.count(re.escape(key))
-        else:
-            def fuzz_score(row):
-                s1 = process.extractOne(query, [row["text"]], scorer=fuzz.token_set_ratio)[1]
-                s2 = process.extractOne(query, [row.get("caption", "")], scorer=fuzz.token_set_ratio)[1]
-                return max(s1, s2) / 100.0
-            work["score"] = work.apply(fuzz_score, axis=1)
-
-    # Power mode: boost rows that look numeric/statistical
-    if power_mode:
-        bonus = work["text"].apply(score_numeric_density)
-        work["score"] = work["score"] + 0.05 * bonus.clip(0, 10)
-
-    # Extract numbers for display
-    work["power_inputs"] = work["text"].apply(extract_power_inputs)
-
-    # Order and return top_k
-    return work.sort_values("score", ascending=False).head(top_k)
-
+def looks_like_power_query(q: str) -> bool:
+    return bool(re.search(r"\b(sd|se|variance|icc|power|mde|minimum detectable|standard deviation|standard error)\b", q, flags=re.I))
 
 # ---------- UI ----------
 st.set_page_config(page_title="Power Inputs Search (Embeddings)", layout="wide")
 st.title("Power Inputs Search (Embeddings)")
 
-# Make sure the data exists, then load
-pkl_path = ensure_embeddings_file()
+with st.sidebar:
+    st.header("Search")
+    query = st.text_input("Query", value="standard deviation of education studies in India")
+    sectors = st.text_input("Sector filter (e.g., education; comma-separated)", value="education")
+    regions = st.text_input("Region/Country filter (e.g., India; comma-separated)", value="India")
+    topk = st.number_input("Results", min_value=1, max_value=50, value=TOPK_DEFAULT, step=1)
+    power_mode = st.toggle("Power mode (prefer sd/se/variance/icc/mde/power)", value=True)
+    use_embeddings = st.toggle("Use embeddings (if key set)", value=True if oai_client else False)
+    run = st.button("Search")
+
+# Try load DF (show nice message if missing)
 try:
-    df = pd.read_pickle(pkl_path)
+    df = _load_df()
 except Exception as e:
-    st.error(f"Could not load {pkl_path}. Error: {e}")
+    st.error(f"Could not load `data/{DATA_FILE}`. Upload `{DATA_FILE}` or `{ZIP_FILE}` to `/data`.\n\nError: {e}")
     st.stop()
 
-# Safety: ensure required columns exist
-for c in ["pub_id", "source_type", "text", "embedding"]:
-    if c not in df.columns:
-        st.error(f"Missing required column `{c}` in embeddings dataframe.")
-        st.stop()
+titles = build_title_index(df)
 
-# Sidebar controls
-with st.sidebar:
-    st.header("Search options")
-    query = st.text_input("Query", placeholder="e.g., sd or icc for health in India")
-    power_mode = st.toggle("Power mode (prioritize numeric/statistical chunks)", value=True,
-                           help="Boosts chunks that contain sd/se/variance/icc/power/mde/n")
-    sector_filter = st.text_input("Sector filter (optional)", placeholder="education, health, labor, climate…")
-    region_filter = st.text_input("Region/Country filter (optional)", placeholder="India, Ghana, Haryana…")
-    top_k = st.slider("Results", 5, 50, TOPK_DEFAULT, 1)
-    use_emb = st.toggle("Use embeddings (requires OpenAI key in Secrets)", value=client is not None)
+if run:
+    q_norm = _norm(query)
+    # If query mentions India or a sector, fold them into filters
+    query_countries = [s.strip() for s in regions.split(",") if s.strip()]
+    query_sectors = [s.strip() for s in sectors.split(",") if s.strip()]
 
-    st.caption("Tip: add **OPENAI_API_KEY** in Streamlit → Settings → Secrets to enable high-quality semantic search.")
-
-# Run search
-if st.button("Search") and query.strip():
-    results = search(
-        df=df,
-        query=query.strip(),
-        top_k=top_k,
-        power_mode=power_mode,
-        sector_filter=sector_filter.strip(),
-        region_filter=region_filter.strip(),
-        use_embeddings=use_emb,
-    )
-
-    if results.empty:
-        st.warning("No results. Try removing filters or different keywords.")
+    # 1) Score
+    if use_embeddings and oai_client and "embedding" in df.columns:
+        qvec = embed_query(q_norm)
+        if qvec is not None:
+            df["score"] = df["embedding"].apply(lambda e: dot(np.array(e, dtype=np.float32), qvec))
+        else:
+            df["score"] = df["text"].apply(lambda t: rough_keyword_score(q_norm, str(t)))
     else:
-        for _, row in results.iterrows():
+        df["score"] = df["text"].apply(lambda t: rough_keyword_score(q_norm, str(t)))
+
+    # 2) Hard filters for sector/region
+    def passes_filters(row):
+        t = str(row["text"])
+        ok_country = _is_country_hit(t, query_countries)
+        ok_sector  = _is_sector_hit(t, query_sectors)
+        return ok_country and ok_sector
+
+    filt = df[df.apply(passes_filters, axis=1)].copy()
+
+    # If power_mode AND the question looks like a power question,
+    # slightly prefer table-ish chunks and add a small bonus for phrases we care about.
+    if power_mode and looks_like_power_query(q_norm):
+        # bonus for table chunks
+        filt["score"] = filt["score"] + np.where(filt["source_type"].str.lower() == "table", 0.10, 0.0)
+        # bonus if text explicitly mentions our keys
+        bonus_words = r"(standard deviation|standard error|\bvariance\b|\bICC\b|minimum detectable|MDE|\bpower\b)"
+        filt["score"] = filt["score"] + filt["text"].str.contains(bonus_words, case=False, regex=True).astype(float)*0.05
+
+    # 3) Rank & display
+    out = filt.sort_values("score", ascending=False).head(int(topk))
+
+    if out.empty:
+        st.warning("No results matched your filters. Try fewer filters or different words.")
+    else:
+        for _, row in out.iterrows():
+            pub = row["pub_id"]
+            typ = row.get("source_type", "text")
+            score = float(row["score"])
+            txt = _norm(str(row["text"]))
+            title = titles.get(pub, f"Study {pub}")
+            power_vals = extract_power_inputs(txt) if power_mode else {}
+
             with st.container(border=True):
-                col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-                with col1:
-                    st.markdown(f"**Study:** {row.get('pub_id', '—')}")
-                    st.markdown(f"**Type:** {row.get('source_type', '—')}")
-                with col2:
-                    st.markdown(f"**Score:** {row.get('score', 0):.2f}")
-                with col3:
-                    st.markdown("**Power inputs:**")
-                    st.markdown(format_power_inputs(row.get("power_inputs", {})))
-                with col4:
-                    cap = row.get("caption", "")
-                    if isinstance(cap, str) and cap.strip():
-                        st.markdown("**Caption:**")
-                        st.markdown(cap[:120] + ("…" if len(cap) > 120 else ""))
+                st.markdown(f"### {title}  \n*{pub} • {typ}*  \nScore: **{score:.2f}**")
 
-                # Excerpt
-                text = row.get("text", "")
-                snippet = (text[:MAX_EXCERPT_CHARS] + "…") if len(text) > MAX_EXCERPT_CHARS else text
-                st.markdown("**Excerpt:**")
-                st.write(snippet)
+                if power_vals:
+                    cols = st.columns(len(power_vals))
+                    for (k,v), c in zip(power_vals.items(), cols):
+                        c.metric(k.upper(), f"{v:g}")
+                else:
+                    st.caption("Power inputs: —")
 
-else:
-    st.info("Enter a query on the left and click **Search**.")
+                # excerpt
+                ex = txt[:MAX_EXCERPT_CHARS] + ("…" if len(txt) > MAX_EXCERPT_CHARS else "")
+                st.write(ex)
