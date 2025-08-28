@@ -1,339 +1,277 @@
-import os
-import ast
-import re
-import json
+# ---------- Power Inputs Search (Embeddings) ----------
+# Clean UI + numeric extraction (sd, se, var, icc, power, mde, n)
+# Works with your prebuilt embeddings_dataframe.pkl
+
+import os, re, json, zipfile, math, io, requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# --------- CONFIG ---------
-DATA_PATH = "data/embeddings_dataframe.pkl"   # put your .pkl here
-EMBEDDING_MODEL = "text-embedding-3-large"    # must match how the .pkl was created
+# Optional fuzzy fallback if no OpenAI key
+try:
+    from rapidfuzz import process, fuzz
+    HAS_FUZZ = True
+except Exception:
+    HAS_FUZZ = False
+
+# Optional OpenAI for query embeddings
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+# ---- CONFIG ----
+DATA_PATH = "data/embeddings_dataframe.pkl"  # your file
+ZIP_CANDIDATES = [
+    "data/embeddings_dataframe.pkl.zip",
+    "data/embeddings_dataframe.zip",
+]
+EMBEDDING_MODEL = "text-embedding-3-large"   # must match how .pkl was created
 TOPK_DEFAULT = 10
 MAX_EXCERPT_CHARS = 1200
 
-# --------- OPTIONAL OPENAI (for embeddings of the query; required for semantic search) ----------
-# We only create the client if an API key is present.
+# ---- OPTIONAL: remote download (if you later store the file elsewhere) ----
+REMOTE_URL = st.secrets.get("EMBEDDINGS_URL", "")  # leave blank unless you add it in Streamlit Secrets
+
+# ---- OpenAI client (only if you add OPENAI_API_KEY in Streamlit Secrets) ----
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "")) or None
-if OPENAI_API_KEY:
-    try:
-        from openai import OpenAI
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as _e:
-        _openai_client = None
-else:
-    _openai_client = None
+client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
-# =====================
-# Utilities
-# =====================
 
-def _as_float(x):
-    try:
-        return float(x)
-    except:
-        return None
+# ---------- Helpers ----------
+def ensure_embeddings_file() -> str:
+    """Return path to the .pkl. If missing, try zip; if provided, try REMOTE_URL."""
+    if os.path.exists(DATA_PATH):
+        return DATA_PATH
 
-def _is_year(x):
-    try:
-        v = int(float(x))
-        return 1800 <= v <= 2100
-    except:
-        return False
+    # Try zip in repo
+    for z in ZIP_CANDIDATES:
+        if os.path.exists(z):
+            try:
+                os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+                with zipfile.ZipFile(z, "r") as zf:
+                    member = next((m for m in zf.namelist() if m.lower().endswith(".pkl")), None)
+                    if not member:
+                        raise RuntimeError("Zip has no .pkl inside.")
+                    with zf.open(member) as src, open(DATA_PATH, "wb") as dst:
+                        dst.write(src.read())
+                return DATA_PATH
+            except Exception as e:
+                st.error(f"Found {z} but failed to extract it: {e}")
+                st.stop()
 
-_NUM = r"(-?\d+(?:\.\d+)?)"
+    # Try remote URL (only if you added EMBEDDINGS_URL in Secrets)
+    if REMOTE_URL:
+        try:
+            os.makedirs(os.path.dirname(DATA_PATH), exist_ok=True)
+            r = requests.get(REMOTE_URL, timeout=60)
+            r.raise_for_status()
+            with open(DATA_PATH, "wb") as f:
+                f.write(r.content)
+            return DATA_PATH
+        except Exception as e:
+            st.error(f"Failed to download embeddings from EMBEDDINGS_URL: {e}")
+            st.stop()
 
-def extract_power_inputs_clean(text: str) -> dict:
-    """
-    Conservative extractor for key power inputs.
-    Returns dict like {"sd": 1.23, "variance": 0.5, "icc": 0.12, "N": 1234, "alpha": 0.05, "power": 0.8, "mde": 0.2}
-    """
-    t = " ".join((text or "").split())
-    out = {}
-
-    # SD
-    m = re.search(rf"(?i)\b(sd|standard\s*deviation|std\.?|σ)\b[^0-9]{{0,20}}{_NUM}", t)
-    if m:
-        val = _as_float(m.group(2))
-        if val is not None and not _is_year(val) and 0 < val < 1000:
-            out["sd"] = val
-
-    # Variance
-    m = re.search(rf"(?i)\b(var(?:iance)?)\b[^0-9]{{0,20}}{_NUM}", t)
-    if m:
-        val = _as_float(m.group(2))
-        if val is not None and not _is_year(val) and 0 <= val < 1e6:
-            out["variance"] = val
-
-    # ICC
-    m = re.search(rf"(?i)\bicc\b[^0-9]{{0,12}}{_NUM}", t)
-    if m:
-        val = _as_float(m.group(1))
-        if val is not None:
-            if 0 <= val <= 1:
-                out["icc"] = val
-            elif 1 < val <= 100:
-                out["icc"] = round(val/100.0, 4)
-
-    # Sample size N
-    m = re.search(rf"(?i)\bN\s*=\s*{_NUM}\b", t)
-    if m:
-        val = _as_float(m.group(1))
-        if val is not None and val >= 10:
-            out["N"] = int(val)
-
-    # Alpha
-    m = re.search(rf"(?i)\b(alpha|significance)\b[^0-9]{{0,12}}{_NUM}", t)
-    if m:
-        val = _as_float(m.group(2))
-        if val is not None and 0 < val < 1:
-            out["alpha"] = val
-
-    # Power
-    m = re.search(rf"(?i)\bpower\b[^0-9]{{0,12}}{_NUM}\s*%?", t)
-    if m:
-        val = _as_float(m.group(1))
-        if val is not None:
-            if 0 < val <= 1:
-                out["power"] = val
-            elif 1 < val <= 100:
-                out["power"] = round(val/100.0, 4)
-
-    # MDE
-    m = re.search(rf"(?i)\b(mde|min(?:imum)?\s*detect(?:able)?\s*effect)\b[^0-9]{{0,12}}{_NUM}", t)
-    if m:
-        val = _as_float(m.group(3) if m.lastindex and m.lastindex >= 3 else m.group(m.lastindex or 1))
-        if val is not None and 0 < val < 1000:
-            out["mde"] = val
-
-    return out
-
-def human_power_dict(d: dict) -> str:
-    if not d:
-        return "—"
-    order = ["sd", "se", "variance", "icc", "N", "alpha", "power", "mde"]
-    parts = []
-    for k in order:
-        if k in d:
-            v = d[k]
-            if k in ("alpha", "power", "icc") and 0 < v <= 1:
-                parts.append(f"{k}: {v:.3f}")
-            else:
-                try:
-                    if float(v).is_integer():
-                        parts.append(f"{k}: {int(v)}")
-                    else:
-                        parts.append(f"{k}: {float(v):.3g}")
-                except:
-                    parts.append(f"{k}: {v}")
-    return " · ".join(parts) if parts else "—"
-
-@st.cache_data(show_spinner=False)
-def load_df(path: str) -> pd.DataFrame:
-    df = pd.read_pickle(path)
-    # Normalize common column names
-    if "text" not in df.columns:
-        # Some dumps might call it 'chunk' or something else
-        txt_col = None
-        for c in df.columns:
-            if str(c).lower() in ("chunk", "chunk_text", "content", "page_text"):
-                txt_col = c
-                break
-        if txt_col:
-            df["text"] = df[txt_col]
-        else:
-            raise RuntimeError("Could not find text column in embeddings dataframe.")
-    # Ensure 'embedding' is a list of floats
-    if isinstance(df["embedding"].iloc[0], str):
-        # sometimes saved as stringified list; convert
-        df["embedding"] = df["embedding"].apply(lambda s: ast.literal_eval(s))
-    return df
-
-@st.cache_resource(show_spinner=False)
-def build_matrix(df: pd.DataFrame):
-    """
-    Returns (matrix, norms) for cosine similarity.
-    """
-    E = np.array(df["embedding"].to_list(), dtype=np.float32)  # shape (n, d)
-    # Cosine similarity => normalize rows
-    norms = np.linalg.norm(E, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    E_norm = E / norms
-    return E_norm
-
-def get_query_embedding(query: str) -> np.ndarray:
-    """
-    Get embedding for the query using OpenAI. Fails with a nice message if no key.
-    """
-    if not _openai_client:
-        st.error("Semantic search needs an OpenAI key. Click ⋮ (top-right) → **Settings** → **Secrets** → add `OPENAI_API_KEY`.\n"
-                 "Then retry the search.")
-        st.stop()
-    try:
-        r = _openai_client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=query
-        )
-        v = np.array(r.data[0].embedding, dtype=np.float32)
-        # normalize
-        n = np.linalg.norm(v)
-        if n == 0:
-            return v
-        return v / n
-    except Exception as e:
-        st.error(f"Embedding call failed: {e}")
-        st.stop()
-
-def contains_any(text: str, keywords: list[str]) -> bool:
-    if not keywords:
-        return True
-    t = (text or "").lower()
-    return any(k.lower() in t for k in keywords)
-
-def pretty_title_from_row(row: pd.Series) -> str:
-    """Make something like PUB-XXXX • text(table) • Page 12 • etc."""
-    parts = []
-    parts.append(str(row.get("pub_id", "Unknown")))
-    stype = row.get("source_type") or "text"
-    parts.append("table" if stype == "table" else "text")
-    if stype == "text" and pd.notnull(row.get("page")):
-        parts.append(f"Page {int(row.get('page'))}")
-    if stype == "table" and pd.notnull(row.get("table_index")):
-        parts.append(f"Table {int(row.get('table_index'))}")
-    return " • ".join(parts)
-
-def clip_excerpt(s: str, max_chars: int = MAX_EXCERPT_CHARS) -> str:
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars].rsplit(" ", 1)[0] + "…"
-
-def badge(text):
-    st.markdown(
-        f"""
-        <span style="
-            display:inline-block;
-            background:#eef2ff;
-            color:#1f3a8a;
-            border:1px solid #c7d2fe;
-            padding:2px 8px;
-            border-radius:9999px;
-            font-size:12px;
-            margin-right:6px;
-        ">{text}</span>
-        """,
-        unsafe_allow_html=True
-    )
-
-# =====================
-# UI
-# =====================
-
-st.set_page_config(page_title="Power Inputs Search", layout="wide")
-st.title("Power Inputs Search (Embeddings)")
-
-# Load data
-try:
-    df = load_df(DATA_PATH)
-except Exception as e:
-    st.error(f"Could not load `data/embeddings_dataframe.pkl`.\n\n"
-             f"Please upload it to your repo at `data/embeddings_dataframe.pkl`.\n\nError: {e}")
+    st.error(f"Could not load {DATA_PATH}. Please upload it to your repo at data/embeddings_dataframe.pkl.")
     st.stop()
 
-E_norm = build_matrix(df)
 
-with st.sidebar:
-    st.subheader("Filters")
-    sector_kw = st.text_input("Sector keywords (optional)", placeholder="education; health; governance")
-    region_kw = st.text_input("Region/country keywords (optional)", placeholder="India; Pakistan; Kenya")
-    include_tables = st.checkbox("Include tables", value=True)
-    power_only = st.checkbox("Power-only (show only rows where SD/Var/ICC/N/α/Power/MDE detected)", value=False)
-    min_sim = st.slider("Min similarity", 0.0, 1.0, 0.0, 0.01)
-    topk = st.slider("Max results", 5, 100, TOPK_DEFAULT, 1)
+def normalize(v):
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    return v / n if n else v
 
-# Main search box
-query = st.text_input("Search (e.g., “variance in student test scores India”)", "")
-go = st.button("Search")
 
-# Hints
-with st.expander("Examples", expanded=False):
-    st.markdown("- `standard deviation test scores India`\n"
-                "- `ICC school cluster trials`\n"
-                "- `minimum detectable effect vaccination`\n"
-                "- `variance student outcomes Kenya`")
+def get_query_embedding(query: str) -> np.ndarray | None:
+    """Use OpenAI if key is present, else None (fallback to fuzzy)."""
+    if client is None:
+        return None
+    try:
+        resp = client.embeddings.create(model=EMBEDDING_MODEL, input=query)
+        return np.array(resp.data[0].embedding, dtype=float)
+    except Exception as e:
+        st.warning(f"Embedding service unavailable, using fallback search. ({e})")
+        return None
 
-if go:
-    if not query.strip():
-        st.warning("Type something to search.")
-        st.stop()
 
-    # 1) Query embedding
-    qv = get_query_embedding(query.strip())
+NUM_PAT = r"[-+]?\d+(?:\.\d+)?"
+def _find(pattern, text):
+    m = re.search(pattern, text, flags=re.I)
+    return float(m.group(1)) if m else None
 
-    # 2) Cosine similarities
-    sims = (E_norm @ qv).astype(np.float32)  # (n,)
+def extract_power_inputs(text: str) -> dict:
+    """
+    Pulls key stats commonly used for power inputs.
+    Heuristic but robust to minor formatting variations.
+    """
+    clean = " ".join(text.split())  # collapse whitespace
 
-    # 3) Attach to df
+    # sd / standard deviation
+    sd = _find(r"(?:\bsd\b|std\.?\s*dev(?:iation)?|standard\s*deviation)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+
+    # se / standard error
+    se = _find(r"(?:\bse\b|standard\s*error)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+
+    # variance / var / σ²
+    var = _find(r"(?:\bvariance\b|\bvar\b|σ\^?2|sigma\^?2)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+
+    # ICC / intracluster corr
+    icc = _find(r"(?:\bicc\b|intra[-\s]*cluster\s*corr(?:elation)?)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+
+    # MDE / detectable effect
+    mde = _find(r"(?:\bmde\b|minimum\s*detectable\s*effect)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+
+    # power (as a probability 0–1 or %). Avoid picking up “power grid”, etc.
+    power = _find(r"(?:statistical\s*power|power\s*\(1-β\)|\bpower\b)\s*[:=]?\s*(" + NUM_PAT + ")", clean)
+
+    # sample size n / N / cluster size
+    n = _find(r"(?:\bn\s*=\s*|\bN\s*=\s*)(\d+)", clean)
+
+    out = {"sd": sd, "se": se, "variance": var, "icc": icc, "mde": mde, "power": power, "n": n}
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def score_numeric_density(text: str) -> int:
+    """Used to boost 'Power Mode' results: count how many target tokens appear."""
+    keys = ["sd", "standard deviation", "se", "standard error", "variance", "var", "icc",
+            "intra cluster", "power", "mde", "minimum detectable", "sample size", " n = "]
+    t = text.lower()
+    return sum(1 for k in keys if k in t)
+
+
+def format_power_inputs(d: dict) -> str:
+    if not d:
+        return "—"
+    nice = []
+    for k in ["sd", "se", "variance", "icc", "mde", "power", "n"]:
+        if k in d:
+            v = d[k]
+            nice.append(f"**{k}**: {v:g}" if isinstance(v, (int, float)) else f"**{k}**: {v}")
+    return " • ".join(nice)
+
+
+def search(df: pd.DataFrame, query: str, top_k: int, power_mode: bool,
+           sector_filter: str, region_filter: str, use_embeddings: bool):
     work = df.copy()
-    work["similarity"] = sims
 
-    # 4) Filter by tables, sector/region keywords
-    if not include_tables:
-        work = work[(work["source_type"].fillna("text") != "table")]
+    # Optional filters by substring (case-insensitive) on text/caption
+    if sector_filter:
+        work = work[work["text"].str.contains(sector_filter, case=False, na=False) |
+                    work.get("caption", pd.Series([""]*len(work))).str.contains(sector_filter, case=False, na=False)]
 
-    sector_list = [w.strip() for w in (sector_kw or "").split(";") if w.strip()]
-    region_list = [w.strip() for w in (region_kw or "").split(";") if w.strip()]
+    if region_filter:
+        work = work[work["text"].str.contains(region_filter, case=False, na=False) |
+                    work.get("caption", pd.Series([""]*len(work))).str.contains(region_filter, case=False, na=False)]
 
-    def _row_passes_keywords(row):
-        hay = " ".join([
-            str(row.get("text", "")),
-            str(row.get("caption", "")),
-            str(row.get("pub_id", "")),
-        ])
-        return contains_any(hay, sector_list) and contains_any(hay, region_list)
+    if work.empty:
+        return work
 
-    if sector_list or region_list:
-        work = work[work.apply(_row_passes_keywords, axis=1)]
+    # Compute score
+    if use_embeddings:
+        q = get_query_embedding(query)
+        if q is not None:
+            q = normalize(q)
+            def dot_sim(vec):
+                v = normalize(np.array(vec, dtype=float))
+                return float(np.dot(v, q))
+            work["score"] = work["embedding"].apply(dot_sim)
+        else:
+            use_embeddings = False  # fallback below
 
-    # 5) Drop low similarities
-    work = work[work["similarity"] >= float(min_sim)]
+    if not use_embeddings:
+        # Fallback: fuzzy + keyword boosts
+        if not HAS_FUZZ:
+            # simple keyword count
+            key = query.lower()
+            work["score"] = work["text"].str.lower().str.count(re.escape(key))
+        else:
+            def fuzz_score(row):
+                s1 = process.extractOne(query, [row["text"]], scorer=fuzz.token_set_ratio)[1]
+                s2 = process.extractOne(query, [row.get("caption", "")], scorer=fuzz.token_set_ratio)[1]
+                return max(s1, s2) / 100.0
+            work["score"] = work.apply(fuzz_score, axis=1)
 
-    # 6) Extract power inputs on the filtered slice
-    work["power_fields"] = work["text"].fillna("").apply(extract_power_inputs_clean)
-    work["has_power"] = work["power_fields"].apply(lambda d: bool(d))
+    # Power mode: boost rows that look numeric/statistical
+    if power_mode:
+        bonus = work["text"].apply(score_numeric_density)
+        work["score"] = work["score"] + 0.05 * bonus.clip(0, 10)
 
-    # 7) If power-only, filter again
-    if power_only:
-        work = work[work["has_power"]]
+    # Extract numbers for display
+    work["power_inputs"] = work["text"].apply(extract_power_inputs)
 
-    # 8) Rank
-    work = work.sort_values("similarity", ascending=False).head(topk)
+    # Order and return top_k
+    return work.sort_values("score", ascending=False).head(top_k)
 
-    # 9) Display
-    st.subheader("Results")
-    st.caption(f"{len(work)} shown")
 
-    if len(work) == 0:
-        st.info("No matches with current filters. Try removing filters or lowering the min similarity.")
+# ---------- UI ----------
+st.set_page_config(page_title="Power Inputs Search (Embeddings)", layout="wide")
+st.title("Power Inputs Search (Embeddings)")
+
+# Make sure the data exists, then load
+pkl_path = ensure_embeddings_file()
+try:
+    df = pd.read_pickle(pkl_path)
+except Exception as e:
+    st.error(f"Could not load {pkl_path}. Error: {e}")
+    st.stop()
+
+# Safety: ensure required columns exist
+for c in ["pub_id", "source_type", "text", "embedding"]:
+    if c not in df.columns:
+        st.error(f"Missing required column `{c}` in embeddings dataframe.")
         st.stop()
 
-    # Download CSV
-    _dl_cols = ["pub_id", "source_type", "page", "table_index", "caption", "similarity", "text"]
-    _csv = work[_dl_cols + ["power_fields"]].copy()
-    _csv["power_fields"] = _csv["power_fields"].apply(lambda d: json.dumps(d, ensure_ascii=False))
-    st.download_button("Download results (CSV)", _csv.to_csv(index=False).encode("utf-8"), file_name="results.csv", mime="text/csv")
+# Sidebar controls
+with st.sidebar:
+    st.header("Search options")
+    query = st.text_input("Query", placeholder="e.g., sd or icc for health in India")
+    power_mode = st.toggle("Power mode (prioritize numeric/statistical chunks)", value=True,
+                           help="Boosts chunks that contain sd/se/variance/icc/power/mde/n")
+    sector_filter = st.text_input("Sector filter (optional)", placeholder="education, health, labor, climate…")
+    region_filter = st.text_input("Region/Country filter (optional)", placeholder="India, Ghana, Haryana…")
+    top_k = st.slider("Results", 5, 50, TOPK_DEFAULT, 1)
+    use_emb = st.toggle("Use embeddings (requires OpenAI key in Secrets)", value=client is not None)
 
-    for i, row in work.reset_index(drop=True).iterrows():
-        with st.container(border=True):
-            left, right = st.columns([0.75, 0.25])
-            with left:
-                st.markdown(f"**{i+1}. {pretty_title_from_row(row)}**")
-                st.write(clip_excerpt(row.get("text", "")))
-                if row.get("source_type") == "table" and pd.notnull(row.get("caption")):
-                    st.caption(f"Table caption: {row['caption']}")
-            with right:
-                badge(f"Score {row['similarity']*100:.1f}")
-                if row.get("has_power"):
-                    badge("Power inputs found")
-                st.markdown("**Power inputs (detected):**")
-                st.write(human_power_dict(row.get("power_fields", {})))
+    st.caption("Tip: add **OPENAI_API_KEY** in Streamlit → Settings → Secrets to enable high-quality semantic search.")
+
+# Run search
+if st.button("Search") and query.strip():
+    results = search(
+        df=df,
+        query=query.strip(),
+        top_k=top_k,
+        power_mode=power_mode,
+        sector_filter=sector_filter.strip(),
+        region_filter=region_filter.strip(),
+        use_embeddings=use_emb,
+    )
+
+    if results.empty:
+        st.warning("No results. Try removing filters or different keywords.")
+    else:
+        for _, row in results.iterrows():
+            with st.container(border=True):
+                col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+                with col1:
+                    st.markdown(f"**Study:** {row.get('pub_id', '—')}")
+                    st.markdown(f"**Type:** {row.get('source_type', '—')}")
+                with col2:
+                    st.markdown(f"**Score:** {row.get('score', 0):.2f}")
+                with col3:
+                    st.markdown("**Power inputs:**")
+                    st.markdown(format_power_inputs(row.get("power_inputs", {})))
+                with col4:
+                    cap = row.get("caption", "")
+                    if isinstance(cap, str) and cap.strip():
+                        st.markdown("**Caption:**")
+                        st.markdown(cap[:120] + ("…" if len(cap) > 120 else ""))
+
+                # Excerpt
+                text = row.get("text", "")
+                snippet = (text[:MAX_EXCERPT_CHARS] + "…") if len(text) > MAX_EXCERPT_CHARS else text
+                st.markdown("**Excerpt:**")
+                st.write(snippet)
+
+else:
+    st.info("Enter a query on the left and click **Search**.")
