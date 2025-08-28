@@ -1,13 +1,12 @@
-# app.py — One-page, strict, “exact-figure” RCT power search
-# • Zip/PKL loader
-# • Embeddings with strict Region+Sector filters (AND)
-# • Returns 1–4 STUDIES (not chunks)
-# • Exact figure for SD/SE/Variance/ICC/MDE/Power shown BIG
-# • Clean citation + link
-# • Debiased scoring (table boost, numeric boost)
-# • Crash-proof extractor (no m.group(1) errors)
+# app.py — “Exact-figure” study search (≤4 results), bulletproof edition
+# - Loads .pkl or .pkl.zip embeddings
+# - Strict Sector & Region filters (AND)
+# - Extracts SD / SE / Variance / ICC / MDE / Power exactly (robust)
+# - Study-level results (≤4), clean cards with big number + citation + link
+# - Embedding model/dimension sanity checks, safe fallback if no key
+# - Filters out references/appendix/empty tables, boosts tables for power queries
 
-import os, io, re, zipfile, pickle
+import os, re, zipfile, pickle
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -20,15 +19,15 @@ DATA_DIR = "data"
 PKL_NAME = "embeddings_dataframe.pkl"
 ZIP_NAME = "embeddings_dataframe.pkl.zip"
 
-# Set these in Streamlit → Settings → Secrets
-EMBED_MODEL = st.secrets.get("EMBED_MODEL") or "text-embedding-3-small"  # "…3-large" if your file has 3072 dims
+# Set these in Streamlit → Manage app → Settings → Secrets
+EMBED_MODEL = st.secrets.get("EMBED_MODEL") or "text-embedding-3-small"  # override in Secrets (you: "...3-large")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "")) or None
 
-MAX_RESULTS = 4           # hard cap
-CHUNKS_PER_STUDY = 3      # top chunks we inspect per study before aggregation
-TABLE_BOOST = 0.25        # prefer tables for power queries
-NUMERIC_BONUS = 0.06      # reward text with sd/se/variance/icc/mde/power terms
-SHOW_EXCERPTS = False     # you said “no paragraphs” for now
+MAX_RESULTS = 4
+CHUNKS_PER_STUDY = 3
+TABLE_BOOST = 0.25
+NUMERIC_BONUS = 0.06
+SHOW_EXCERPTS = False  # you said no paragraphs
 
 # ============================ OPENAI ============================
 
@@ -51,7 +50,7 @@ def _read_pickle_bytes_from_zip(zip_path: str) -> bytes:
 
 @st.cache_data(show_spinner=False)
 def load_embeddings_df() -> Tuple[pd.DataFrame, int]:
-    """Load DataFrame from data/embeddings_dataframe.pkl or .pkl.zip; validate columns."""
+    """Load DataFrame from data/embeddings_dataframe.pkl or .pkl.zip; validate columns & dims."""
     pkl_path = os.path.join(DATA_DIR, PKL_NAME)
     zip_path = os.path.join(DATA_DIR, ZIP_NAME)
 
@@ -66,15 +65,15 @@ def load_embeddings_df() -> Tuple[pd.DataFrame, int]:
         df = pickle.loads(raw)
     except Exception as e:
         raise RuntimeError(
-            "Could not unpickle the embeddings file. This is usually a NumPy version mismatch.\n"
-            "Fix: keep numpy==2.0.1 in requirements, OR re-export embeddings as plain lists in Colab.\n\n"
+            "Could not unpickle the embeddings file. Keep numpy==2.0.1 in requirements, "
+            "or re-export embeddings as plain lists in Colab.\n\n"
             f"Loader error: {e}"
         )
 
     if not isinstance(df, pd.DataFrame):
         raise ValueError("Embeddings file did not contain a pandas DataFrame.")
 
-    # Normalize expected columns
+    # Normalize required columns
     if "text" not in df.columns:
         for alt in ["chunk_text", "content", "body"]:
             if alt in df.columns: df = df.rename(columns={alt: "text"}); break
@@ -82,9 +81,9 @@ def load_embeddings_df() -> Tuple[pd.DataFrame, int]:
         for alt in ["embeddings", "vector", "vec"]:
             if alt in df.columns: df = df.rename(columns={alt: "embedding"}); break
     if "text" not in df.columns or "embedding" not in df.columns:
-        raise ValueError(f"Dataframe needs 'text' and 'embedding'. Found: {list(df.columns)}")
+        raise ValueError(f"DataFrame needs 'text' and 'embedding'. Found: {list(df.columns)}")
 
-    # Ensure embeddings are lists of equal length
+    # Coerce embeddings to lists and drop bad rows
     def to_list(v):
         if isinstance(v, (list, tuple, np.ndarray)): return list(v)
         if isinstance(v, str) and v.strip().startswith("["):
@@ -124,7 +123,7 @@ def embed_query(q: str) -> Optional[np.ndarray]:
         st.warning(f"Embedding service error: {e}")
         return None
 
-# ============================ PARAM EXTRACTOR (CRASH-PROOF) ============================
+# ============================ PARAM EXTRACTOR (SAFE) ============================
 
 NUM = r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)"
 
@@ -137,16 +136,14 @@ def looks_like_power_query(q: str) -> bool:
     ])
 
 def extract_power_inputs(text: str) -> Dict[str, float]:
-    """
-    Extract SD / SE / variance / ICC / MDE / power when wording looks like a PARAMETER,
-    not a standardized effect (“0.19 SD gain”). Never crashes on group(1).
-    """
+    """Crash-proof extraction of SD/SE/variance/ICC/MDE/power (parameter phrasing only)."""
     t = " " + str(text).lower() + " "
 
     def pick(regexes, post_filter=None):
         for rgx in regexes:
             m = re.search(rgx, t, flags=re.I)
             if not m: continue
+            # SAFE: use captured group if present, else whole match (prevents group(1) crash)
             span = m.group(1) if m.lastindex else m.group(0)
             n = re.search(NUM, span)
             if not n: continue
@@ -174,19 +171,15 @@ def extract_power_inputs(text: str) -> Dict[str, float]:
 
     variance = pick([ rf"\bvariance\s*(?:=|:)?\s*({NUM})\b" ], post_filter=not_year)
 
-    icc = pick([
-        rf"\b(?:icc|intracluster|intra[-\s]?cluster\s+correlation(?:\s+coefficient)?)\s*(?:=|:)?\s*({NUM})\b"
-    ], post_filter=icc_0_1)
+    icc = pick([ rf"\b(?:icc|intracluster|intra[-\s]?cluster\s+correlation(?:\s+coefficient)?)\s*(?:=|:)?\s*({NUM})\b" ],
+               post_filter=icc_0_1)
 
-    mde = pick([
-        rf"\b(?:mde|mbe|minimum\s+detectable\s+effect(?:\s+size)?)\s*(?:=|:)?\s*({NUM})\s*%?\b",
-        rf"\b({NUM})\s*%?\s*(?:mde|mbe|minimum\s+detectable\s+effect(?:\s+size)?)\b"
-    ], post_filter=pct_0_200)
+    mde = pick([ rf"\b(?:mde|mbe|minimum\s+detectable\s+effect(?:\s+size)?)\s*(?:=|:)?\s*({NUM})\s*%?\b",
+                 rf"\b({NUM})\s*%?\s*(?:mde|mbe|minimum\s+detectable\s+effect(?:\s+size)?)\b" ],
+               post_filter=pct_0_200)
 
-    power = pick([
-        rf"\bpower\s*(?:=|:)?\s*({NUM})\s*%?\b",
-        rf"\b({NUM})\s*%?\s*power\b"
-    ], post_filter=pct_0_200)
+    power = pick([ rf"\bpower\s*(?:=|:)?\s*({NUM})\s*%?\b",
+                   rf"\b({NUM})\s*%?\s*power\b" ], post_filter=pct_0_200)
 
     out = {}
     if sd is not None: out["sd"] = sd
@@ -235,6 +228,7 @@ def format_citation(row: pd.Series, titles: Dict[str,str]) -> str:
 
 st.set_page_config(page_title="Power Inputs Search (Embeddings)", layout="wide")
 st.title("Power Inputs Search (Embeddings)")
+st.success("✅ APP READY — type your query, set Sector & Country/Region, pick a figure, then Search.")
 
 # Load data
 try:
@@ -243,48 +237,42 @@ except Exception as e:
     st.error(str(e)); st.stop()
 
 with st.expander("Diagnostics (setup)", expanded=False):
+    import sys
+    st.write("Python:", sys.version.split()[0])
+    st.write("Streamlit:", st.__version__)
     st.write("Rows:", len(df))
     st.write("Columns:", list(df.columns))
     st.write("Embedding dimension (from file):", emb_dim)
     st.write("Embedding model (secrets):", EMBED_MODEL)
     st.caption("1536 ↔ text-embedding-3-small, 3072 ↔ text-embedding-3-large")
 
-# Sidebar — STRICT filters + focus
+# Sidebar — strict filters & focus
 with st.sidebar:
     st.header("Search controls")
     query = st.text_input("What do you want?", placeholder="e.g., sd of education studies in India").strip()
     sectors = st.text_input("Sector (comma-separated, exact)", value="").strip()
     regions = st.text_input("Country/Region (comma-separated, exact)", value="").strip()
-    focus = st.selectbox("Figure to extract (exact)", ["auto","sd","se","variance","icc","mde","power"], index=0,
-                         help="Pick the exact figure you want. 'auto' tries to infer from your query.")
+    focus = st.selectbox("Figure to extract (exact)", ["auto","sd","se","variance","icc","mde","power"], index=0)
     topk = st.slider("How many studies (max 4)", 1, 4, 3, 1)
     use_embeddings = st.toggle("Use embeddings (needs OPENAI_API_KEY)", value=bool(client))
     power_mode = st.toggle("Prefer numeric/table chunks", value=True)
 
-# Build embedding matrix if needed
-EMB = None
-if use_embeddings and client is not None:
-    try:
-        EMB = np.vstack(df["embedding"].apply(lambda e: np.asarray(e, dtype=np.float32)).to_numpy())
-    except Exception as e:
-        st.error(f"Bad embeddings column. {e}"); st.stop()
-
-# Build titles for nice display
+# Titles for nicer display
 titles = {}
 try:
     titles = {pid: guess_title_from_first_chunk(g) for pid, g in df.groupby("pub_id")}
 except Exception:
     pass
 
-# =============== SEARCH ===============
+# ============================ HELPERS ============================
+
 def parse_list_field(s: str) -> List[str]:
     return [x.strip().lower() for x in s.split(",") if x.strip()]
 
 def enforce_filters(row: pd.Series, countries: List[str], sectors: List[str]) -> bool:
     """
-    AND logic: if the user supplies countries, all chunks must mention
-    at least one of them; same for sectors. If the df has explicit columns,
-    we try them first, else we fall back to text contains.
+    AND logic. If explicit 'country'/'sector' columns exist, we use them; else substring in text.
+    Also drops refs/appendix and empty tables.
     """
     t = str(row.get("text","")).lower()
 
@@ -293,24 +281,22 @@ def enforce_filters(row: pd.Series, countries: List[str], sectors: List[str]) ->
         if "country" in row.index and isinstance(row["country"], str) and row["country"].strip():
             if row["country"].strip().lower() not in countries:
                 return False
-        else:
-            if not any(c in t for c in countries):
-                return False
+        elif not any(c in t for c in countries):
+            return False
 
     # Sector
     if sectors:
         if "sector" in row.index and isinstance(row["sector"], str) and row["sector"].strip():
             if row["sector"].strip().lower() not in sectors:
                 return False
-        else:
-            if not any(s in t for s in sectors):
-                return False
+        elif not any(s in t for s in sectors):
+            return False
 
-    # Drop refs/appendix unless query explicitly about power params
+    # Drop obvious noise unless the query explicitly asks power params
     if re.search(r"\b(references|bibliography|appendix)\b", t) and not looks_like_power_query(query):
         return False
 
-    # Drop “empty table” stubs
+    # Drop empty table stubs
     if str(row.get("source_type","")).lower() == "table" and re.search(r"columns:\s*0\b", t):
         return False
 
@@ -337,48 +323,42 @@ def detect_focus(q: str, manual: str) -> str:
 
 def choose_metric_from_group(group: pd.DataFrame, metric: str) -> Optional[float]:
     """
-    Pick the 'best' metric value for a study:
+    Pick the focused metric for a study:
     1) Prefer table chunks
-    2) Then other chunks
-    Returns the first non-None value we find.
+    2) Else other chunks
     """
-    # Sort by our working score if present, else by page
     g = group.copy()
+    # Sort by score desc, with tables ahead
+    g["_table"] = (g["source_type"].str.lower() == "table").astype(int)
     if "score" in g.columns:
-        g = g.sort_values(["source_type", "score"], ascending=[True, False])
+        g = g.sort_values(["_table", "score"], ascending=[False, False])
     else:
-        g = g.sort_values(["source_type", "page"], ascending=[True, True])
+        g = g.sort_values(["_table", "page"], ascending=[False, True])
 
-    # Table first
-    for prefer_table in (True, False):
-        for _, r in g.iterrows():
-            if prefer_table and str(r.get("source_type","")).lower() != "table":
-                continue
-            vals = r.get("power_inputs") or {}
-            if metric in vals and vals[metric] is not None:
-                return float(vals[metric])
+    for _, r in g.iterrows():
+        vals = r.get("power_inputs") or {}
+        if metric in vals and vals[metric] is not None:
+            return float(vals[metric])
     return None
 
 def format_metric_value(metric: str, val: Optional[float]) -> str:
     if val is None: return "—"
     if metric == "power":
-        # Show both formats if appropriate
-        if 0 <= val <= 1:
-            return f"{val*100:.0f}%  ({val:g})"
-        if 0 < val <= 100:
-            return f"{val:g}%"
+        if 0 <= val <= 1:   return f"{val*100:.0f}%  ({val:g})"
+        if 0 < val <= 100:  return f"{val:g}%"
     return f"{val:g}"
+
+# ============================ SEARCH ============================
 
 if st.button("Search") and query:
     countries = parse_list_field(regions)
-    sectors_ = parse_list_field(sectors)
+    sectors_  = parse_list_field(sectors)
     focus_metric = detect_focus(query, focus)
 
     work = df.copy()
-    # Keep only rows passing strict filters
     work = work[work.apply(lambda r: enforce_filters(r, countries, sectors_), axis=1)]
     if work.empty:
-        st.warning("No chunks matched your filters (Region/Sector are strict). Try adjusting them.")
+        st.warning("No chunks matched your (strict) Sector/Region filters. Try adjusting them.")
         st.stop()
 
     # Score chunks
@@ -393,7 +373,7 @@ if st.button("Search") and query:
             st.warning("Embedding call failed; falling back to keyword overlap.")
             work["score"] = work["text"].apply(lambda t: keyword_overlap(query, t))
         else:
-            # Dimension sanity-check
+            # dimension sanity
             if E.shape[1] != qvec.size:
                 st.error(
                     f"Model/file dimension mismatch. Query dim={qvec.size}, file dim={E.shape[1]}.\n"
@@ -405,7 +385,7 @@ if st.button("Search") and query:
     else:
         work["score"] = work["text"].apply(lambda t: keyword_overlap(query, t))
 
-    # Power-query boosts: tables + numeric terms
+    # Power boosts
     if power_mode and looks_like_power_query(query):
         work["score"] = work["score"] + np.where(work["source_type"].str.lower()=="table", TABLE_BOOST, 0.0)
         work["score"] = work["score"] + work["text"].apply(
@@ -414,15 +394,14 @@ if st.button("Search") and query:
             ) else 0.0
         )
 
-    # Extract parameters per chunk (needed to pick exact figure)
+    # Extract parameters per chunk
     work["power_inputs"] = work["text"].apply(extract_power_inputs)
 
-    # Aggregate to STUDY level
+    # Aggregate to study level (≤ CHUNKS_PER_STUDY per study considered)
     work = work.sort_values("score", ascending=False)
     work["_rank_within_pub"] = work.groupby("pub_id").cumcount()
     best = work[work["_rank_within_pub"] < CHUNKS_PER_STUDY].copy()
 
-    # Build per-study rows
     studies = (
         best.groupby("pub_id")
             .agg(
@@ -434,21 +413,18 @@ if st.button("Search") and query:
                 title=("title", "first"),
                 doi=("doi", "first"),
                 url=("url", "first"),
-                # Keep lists of dicts so we can choose the focused metric intelligently
                 power_inputs_list=("power_inputs", list)
             )
             .reset_index()
             .sort_values("study_score", ascending=False)
     )
 
-    # Choose exact metric per study + merge “other” metrics
+    # Build rows with exact figure (and filter out those lacking it if user chose a specific focus)
     rows = []
     for _, r in studies.iterrows():
         group = best[best["pub_id"] == r["pub_id"]].copy()
-        # attach per-row extractor dict so choose_metric can see them
-        group["power_inputs"] = group["power_inputs"]
         exact_val = choose_metric_from_group(group, focus_metric)
-        # also merge "other" metrics (first-seen)
+        # merge other metrics (first-seen)
         merged = {}
         for d in r["power_inputs_list"]:
             for k, v in (d or {}).items():
@@ -466,17 +442,21 @@ if st.button("Search") and query:
             "all_metrics": merged
         })
 
-    # Limit to MAX_RESULTS / user choice
+    # If user asked a specific figure (not Auto), require it to be present
+    if focus_metric != "auto":
+        rows = [r for r in rows if r["exact_metric_value"] is not None]
+
+    # Cap to MAX_RESULTS / slider
     rows = rows[: min(int(topk), MAX_RESULTS)]
+
     if not rows:
-        st.warning("No studies after aggregation. Try relaxing filters.")
+        st.warning("No studies contained that exact figure. Try another figure or adjust filters.")
         st.stop()
 
-    # Display clean cards (no paragraphs unless you enable SHOW_EXCERPTS)
+    # Display cards (clean; no paragraphs unless SHOW_EXCERPTS=True)
     st.success(f"Top {len(rows)} study/studies (focus: {focus_metric.upper() if focus_metric!='auto' else 'AUTO'})")
     for row in rows:
         pub = row["pub_id"]
-        # Build a fake one-row Series to format citation nicely
         fake = pd.Series({
             "pub_id": pub,
             "title": row["title"],
@@ -490,7 +470,6 @@ if st.button("Search") and query:
         top_value = format_metric_value(focus_metric if focus_metric!="auto" else "sd", row["exact_metric_value"])
 
         with st.container(border=True):
-            # TOP LINE: number big + title/link
             c1, c2 = st.columns([1, 5], gap="large")
             with c1:
                 st.metric((focus_metric if focus_metric!="auto" else "sd").upper(), top_value)
@@ -500,7 +479,7 @@ if st.button("Search") and query:
                 else:
                     st.markdown(f"### {cit}  \n*{pub}* · Score **{row['study_score']:.2f}**")
 
-            # OTHER METRICS (compact row of badges)
+            # Other parameters
             others = row["all_metrics"].copy()
             focus_key = focus_metric if focus_metric!="auto" else "sd"
             if focus_key in others: others.pop(focus_key, None)
