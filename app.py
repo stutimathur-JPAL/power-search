@@ -1,4 +1,4 @@
-# --- Streamlit app: upload embeddings + optional metadata; show title & section ---
+# --- Streamlit app: nicer cards + Power mode extraction ---
 import io, pickle, re
 import numpy as np
 import pandas as pd
@@ -6,12 +6,13 @@ import streamlit as st
 
 EMBED_MODEL = "text-embedding-3-large"
 
+# Get key from Secrets or once-per-session paste
 OPENAI_KEY = st.secrets.get("OPENAI_API_KEY") or st.session_state.get("OPENAI_API_KEY")
 
 st.set_page_config(page_title="Paper Search", layout="wide")
 st.title("Paper Search")
 
-# Allow pasting a key if Secrets aren't set
+# Optional: paste key if Secrets not set
 if not OPENAI_KEY:
     with st.expander("🔐 Add your OpenAI key (or set it in Settings → Secrets)"):
         pasted = st.text_input("OpenAI API key", type="password")
@@ -21,8 +22,9 @@ if not OPENAI_KEY:
 
 st.subheader("Data source")
 emb_file = st.file_uploader("Upload embeddings file (.pkl)", type=["pkl"])
-meta_file = st.file_uploader("Optional: upload metadata CSV (columns: pub_id,title,url or doi)", type=["csv"])
+meta_file = st.file_uploader("Optional metadata CSV (columns: pub_id,title,url or doi)", type=["csv"])
 
+# ---------- Loaders ----------
 @st.cache_data(show_spinner=True, ttl=3600)
 def load_embeddings(b: bytes) -> pd.DataFrame:
     return pickle.load(io.BytesIO(b))  # expects a DataFrame with an 'embedding' column
@@ -71,8 +73,32 @@ def guess_section(text: str, row: pd.Series) -> str:
     p = row.get("page")
     return f"Page {int(p)}" if pd.notna(p) else "Text"
 
-df = None; M = None; meta = None
+# ---------- Power extractor (simple rules) ----------
+NUM = r"[-+]?\d+(?:\.\d+)?"
+PCT = r"[-+]?\d+(?:\.\d+)?\s*%"
 
+def find_one(pattern: str, s: str):
+    m = re.search(pattern, s, flags=re.I)
+    return m.group(1).strip() if m else None
+
+def extract_power_bits(s: str) -> dict:
+    s = s or ""
+    out = {}
+    out["power"]   = find_one(r"\bpower(?:ed|)\s*(?:at|=|of|to)?\s*(%s)" % PCT, s) or \
+                     find_one(r"\bpower(?:ed|)\s*(?:at|=|of|to)?\s*(%s)" % NUM, s)
+    out["alpha"]   = find_one(r"\balpha\s*(?:=|at|:)\s*(%s)" % NUM, s)
+    out["mde"]     = find_one(r"(?:minimum detectable effect|mde|mdes)\D*(%s)" % NUM, s)
+    out["effect"]  = find_one(r"(?:effect size|cohen.?s d)\D*(%s)" % NUM, s)
+    out["sd"]      = find_one(r"(?:standard deviation|sd|σ)\D*(%s)" % NUM, s)
+    out["var"]     = find_one(r"(?:variance|var)\D*(%s)" % NUM, s)
+    out["icc"]     = find_one(r"(?:intra[-\s]?cluster correlation|icc)\D*(%s)" % NUM, s)
+    out["n_total"] = find_one(r"(?:sample size|total\s+N|N\s*=\s*)(%s)" % NUM, s)
+    # clean percents like "80 %" -> "80%"
+    if out["power"] and " %" in out["power"]: out["power"] = out["power"].replace(" %", "%")
+    return {k:v for k,v in out.items() if v}
+
+# ---------- Load data ----------
+df = None; M = None; meta = None
 if emb_file is not None:
     try:
         df = load_embeddings(emb_file.read())
@@ -89,12 +115,9 @@ if meta_file is not None:
     except Exception as e:
         st.error(f"Could not read metadata CSV: {e}")
 
-if df is not None and meta is not None:
-    if "pub_id" in df.columns:
-        df["pub_id"] = df["pub_id"].astype(str)
-        df = df.merge(meta, how="left", on="pub_id", suffixes=("","_meta"))
-    else:
-        st.warning("Embeddings file has no 'pub_id' column; titles can’t be matched.")
+if df is not None and meta is not None and "pub_id" in df.columns:
+    df["pub_id"] = df["pub_id"].astype(str)
+    df = df.merge(meta, how="left", on="pub_id", suffixes=("","_meta"))
 
 with st.expander("Show data preview"):
     if df is not None:
@@ -102,16 +125,23 @@ with st.expander("Show data preview"):
         st.write(f"Rows: {len(df):,}")
         st.dataframe(df.head(10)[cols] if cols else df.head(10), use_container_width=True)
     else:
-        st.info("Upload your embeddings `.pkl` (and optionally a metadata CSV) to enable search.")
+        st.info("Upload your embeddings `.pkl` (and optionally metadata CSV) to enable search.")
 
+# ---------- Query UI ----------
 st.subheader("Search")
-q = st.text_input("Ask (e.g., 'variance in student test scores')", "")
-topk = st.number_input("Results", 1, 50, 10)
+colA, colB, colC = st.columns([3,1,1])
+with colA:
+    q = st.text_input("Query (e.g., 'variance in student test scores')", "")
+with colB:
+    topk = st.number_input("Results", 1, 50, 10)
+with colC:
+    power_mode = st.checkbox("Power mode", value=True, help="Try to extract power inputs (power, alpha, MDE, SD, ICC, N).")
+
 go = st.button("Search") or bool(q)
 
 if go:
     if df is None or M is None:
-        st.warning("Please upload your embeddings `.pkl` above first."); st.stop()
+        st.warning("Please upload your embeddings `.pkl` first."); st.stop()
     if not OPENAI_KEY:
         st.warning("Add OPENAI_API_KEY in Settings → Secrets (or paste it above)."); st.stop()
 
@@ -124,26 +154,42 @@ if go:
     st.subheader("Results")
     for _, row in out.iterrows():
         title = row.get("title")
-        name = title if isinstance(title, str) and title.strip() else str(row.get("pub_id"))
+        name  = title if isinstance(title, str) and title.strip() else str(row.get("pub_id"))
         section = guess_section(str(row.get("text") or ""), row)
-        header = f"{row['score']:>5.1f} | {name} | {section}"
+        link = None
+        if isinstance(row.get("url"), str) and row["url"].startswith(("http://","https://")):
+            link = row["url"]
+        elif isinstance(row.get("doi"), str) and row["doi"]:
+            doi = row["doi"].strip()
+            link = doi if doi.startswith("http") else f"https://doi.org/{doi}"
 
-        with st.expander(header):
-            link = None
-            if isinstance(row.get("url"), str) and row["url"].startswith(("http://","https://")):
-                link = row["url"]
-            elif isinstance(row.get("doi"), str) and row["doi"]:
-                doi = row["doi"].strip()
-                link = doi if doi.startswith("http") else f"https://doi.org/{doi}"
-            if link:
-                st.markdown(f"**Link:** {link}")
+        # Card header
+        st.markdown(f"### {name}")
+        badgeline = f"`{section}` • `{row.get('source_type','text')}` • **Score: {row['score']:.1f}**"
+        if link: badgeline += f" • [Open link]({link})"
+        st.markdown(badgeline)
+
+        # Two columns: power chips (right) + clean excerpt (left)
+        c1, c2 = st.columns([2,1])
+        with c1:
+            txt = str(row.get("text") or "")
+            st.markdown("**Excerpt:**")
+            st.write(txt[:1200] + ("…" if len(txt) > 1200 else ""))
 
             cap = row.get("caption")
             if isinstance(cap, str) and cap.strip():
-                st.markdown(f"**Caption:** {cap}")
+                st.caption(f"Caption: {cap}")
 
-            txt = str(row.get("text") or "")
-            st.markdown("**Excerpt:**")
-            st.write(txt[:1500] + ("…" if len(txt) > 1500 else ""))
+        with c2:
+            if power_mode:
+                bits = extract_power_bits(row.get("text") or "")
+                st.markdown("**Power inputs (detected):**")
+                if bits:
+                    for k,v in bits.items():
+                        st.markdown(f"- **{k}**: {v}")
+                else:
+                    st.write("— none found in this chunk —")
+
+        st.divider()
 
     st.caption("Scores are cosine similarity × 100 (higher = more relevant).")
