@@ -458,3 +458,95 @@ if st.button("Search") and query.strip():
                 st.write(ex)
 else:
     st.info("Type a query (e.g., **sd of education studies in India**), set Sector/Region, then click **Search**.")
+
+# ===================== PATCH START (safe extractor + filter fix) =====================
+# This replaces the old extractor that crashed on m.group(1), and removes the
+# str.contains() warning by using a non-capturing regex.
+
+import re
+NUM = r"[-+]?(?:\d+(?:\.\d+)?|\.\d+)"
+
+def looks_like_power_query(q: str) -> bool:
+    q = (q or "").lower()
+    return any(k in q for k in [
+        "sd","standard deviation","std dev",
+        "se","standard error",
+        "variance","icc","mde","minimum detectable","power"
+    ])
+
+def extract_power_inputs(text: str) -> dict:
+    """
+    Robustly extract SD / SE / variance / ICC / MDE / power as parameters.
+    Avoids picking effect-size sentences like “0.19 SD gain”.
+    Never crashes on m.group(1).
+    """
+    t = " " + str(text).lower() + " "
+
+    def pick(regexes, post_filter=None):
+        for rgx in regexes:
+            m = re.search(rgx, t, flags=re.I)
+            if not m:
+                continue
+            # get a numeric substring safely (use captured group if present)
+            span = m.group(1) if m.lastindex else m.group(0)
+            n = re.search(NUM, span)
+            if not n:
+                continue
+            try:
+                x = float(n.group(0))
+            except Exception:
+                continue
+            if post_filter and not post_filter(x, m):
+                continue
+            return x
+        return None
+
+    not_year   = lambda x, m: not (1900 <= x <= 2100)
+    pct_0_200  = lambda x, m: 0 <= x <= 200
+    icc_0_1    = lambda x, m: 0 <= x <= 1
+
+    # SD: parameter phrasing only; avoid effect-size “gain/impact/units”
+    sd = pick([
+        rf"(?:std\.?\s*dev(?:iation)?|standard\s+deviation|sd)\s*(?:=|:|\bof\b|\()\s*({NUM})\s*\)?\b(?!\s*(units|across|increase|improv|gain|impact|effect))",
+        rf"\b({NUM})\s*(?:std\.?\s*dev(?:iation)?|standard\s+deviation|sd)\b(?!\s*(units|across|increase|improv|gain|impact|effect))"
+    ], post_filter=not_year)
+
+    # SE: **both patterns CAPTURE the number** (this was the crash)
+    se = pick([
+        rf"(?:standard\s+error|se)\s*(?:=|:|\()\s*({NUM})\s*\)?\b",
+        rf"\b({NUM})\s*(?:standard\s+error|se)\b"
+    ], post_filter=not_year)
+
+    variance = pick([ rf"\bvariance\s*(?:=|:)?\s*({NUM})\b" ], post_filter=not_year)
+
+    icc = pick([
+        rf"\b(?:icc|intracluster|intra[-\s]?cluster\s+correlation(?:\s+coefficient)?)\s*(?:=|:)?\s*({NUM})\b"
+    ], post_filter=icc_0_1)
+
+    mde = pick([
+        rf"\b(?:mde|minimum\s+detectable\s+effect(?:\s+size)?)\s*(?:=|:)?\s*({NUM})\s*%?\b",
+        rf"\b({NUM})\s*%?\s*(?:mde|minimum\s+detectable\s+effect(?:\s+size)?)\b"
+    ], post_filter=pct_0_200)
+
+    power = pick([
+        rf"\bpower\s*(?:=|:)?\s*({NUM})\s*%?\b",
+        rf"\b({NUM})\s*%?\s*power\b"
+    ], post_filter=pct_0_200)
+
+    out = {}
+    if sd is not None: out["sd"] = sd
+    if se is not None: out["se"] = se
+    if variance is not None: out["variance"] = variance
+    if icc is not None: out["icc"] = icc
+    if mde is not None: out["mde"] = mde
+    if power is not None: out["power"] = power
+    return out
+
+# If your code builds a `bonus_words` regex for str.contains, make it NON-capturing:
+# Old (warns): "(standard deviation|standard error|...|MDE|power)"
+# New (no warning):
+try:
+    bonus_words = r"(?:standard deviation|standard error|\bvariance\b|\bICC\b|minimum detectable|MDE|\bpower\b)"
+except Exception:
+    pass
+# ====================== PATCH END ===========================================
